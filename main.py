@@ -360,12 +360,14 @@ class LivePulsePlugin(Star):
 
     @filter.command_group("live")
     def live(self):
+        """Live stream monitoring commands: add, remove, list, check, lang, notify, end_notify, status, test_notify"""
         pass
 
     @live.command("add")
     async def cmd_add(
         self, event: AstrMessageEvent, platform: str = "", channel_id: str = ""
     ):
+        """Add monitors by platform+ID or URL. Supports batch add of up to 20 channels."""
         origin = event.unified_msg_origin
         raw_args = self._parse_batch_args(event, "add")
         if not raw_args:
@@ -422,6 +424,46 @@ class LivePulsePlugin(Star):
             max_global,
         )
         result.truncated = truncated
+
+        success_by_platform: dict[str, list[str]] = {}
+        for r in result.items:
+            if r.status == "success" and r.info:
+                success_by_platform.setdefault(r.info.platform, []).append(r.info.channel_id)
+
+        live_channels: list[tuple[str, str, StatusSnapshot]] = []
+        for plat, cids in success_by_platform.items():
+            checker = self._get_checker(plat)
+            if checker is None or self._session is None:
+                continue
+            try:
+                statuses = await checker.check_status(cids, self._session)
+            except Exception:
+                continue
+            for cid, snap in statuses.items():
+                if snap.is_live and snap.success:
+                    live_channels.append((plat, cid, snap))
+
+        if self._notifier is not None and live_channels:
+            async with self._store.lock:
+                gs = self._store.get_group(origin)
+                if gs:
+                    for plat, cid, snap in live_channels:
+                        entry = gs.monitors.get(plat, {}).get(cid)
+                        if entry:
+                            entry.initialized = True
+                            entry.last_status = "live"
+                            entry.last_stream_id = snap.stream_id
+                await self._store.persist()
+
+            for plat, cid, snap in live_channels:
+                task = asyncio.create_task(
+                    self._notifier.send_live_notification(
+                        origin, plat, snap, self._global_notify, force=True,
+                    )
+                )
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+
         yield event.plain_result(
             self._format_batch_response(event, result, "add", max_per_group, max_global)
         )
@@ -430,6 +472,7 @@ class LivePulsePlugin(Star):
     async def cmd_remove(
         self, event: AstrMessageEvent, platform: str = "", channel_id: str = ""
     ):
+        """Remove monitors by platform+ID or URL. Supports batch remove."""
         origin = event.unified_msg_origin
         raw_args = self._parse_batch_args(event, "remove")
         if not raw_args:
@@ -492,6 +535,7 @@ class LivePulsePlugin(Star):
 
     @live.command("list")
     async def cmd_list(self, event: AstrMessageEvent):
+        """List all monitors in the current group with live status."""
         origin = event.unified_msg_origin
         gs = self._store.get_group(origin)
         if gs is None or not any(gs.monitors.values()):
@@ -531,6 +575,7 @@ class LivePulsePlugin(Star):
 
     @live.command("check")
     async def cmd_check(self, event: AstrMessageEvent, platform: str, channel_id: str):
+        """Check one-off live status of a specific channel."""
         platform = platform.lower()
         if platform not in _VALID_PLATFORMS:
             yield event.plain_result(
@@ -601,6 +646,7 @@ class LivePulsePlugin(Star):
 
     @live.command("lang")
     async def cmd_lang(self, event: AstrMessageEvent, lang: str):
+        """Switch group language (en / zh-Hans / zh-Hant)."""
         lang = lang.strip()
         if lang not in ("en", "zh-Hans", "zh-Hant"):
             yield event.plain_result(self._t(event, "cmd.lang.invalid", lang=lang))
@@ -614,6 +660,7 @@ class LivePulsePlugin(Star):
 
     @live.command("notify")
     async def cmd_notify(self, event: AstrMessageEvent):
+        """Toggle or view live-start notification status."""
         raw_args = self._parse_batch_args(event, "notify")
         arg = raw_args[0] if raw_args else None
 
@@ -650,6 +697,7 @@ class LivePulsePlugin(Star):
 
     @live.command("end_notify")
     async def cmd_end_notify(self, event: AstrMessageEvent):
+        """Toggle or view end-of-stream notification status."""
         raw_args = self._parse_batch_args(event, "end_notify")
         arg = raw_args[0] if raw_args else None
 
@@ -689,6 +737,7 @@ class LivePulsePlugin(Star):
 
     @live.command("status")
     async def cmd_status(self, event: AstrMessageEvent):
+        """Show plugin health, poller stats, and notification status."""
         active = sum(1 for p in self._pollers if p.healthy)
         total = len(self._pollers)
 
@@ -724,6 +773,7 @@ class LivePulsePlugin(Star):
 
     @live.command("test_notify")
     async def cmd_test_notify(self, event: AstrMessageEvent, delay: str | None = None):
+        """Send simulated live/end notifications after a delay (max 300s)."""
         if self._notifier is None:
             yield event.plain_result(self._t(event, "cmd.test_notify.not_ready"))
             return
